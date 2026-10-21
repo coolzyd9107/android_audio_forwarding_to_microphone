@@ -25,12 +25,12 @@ public final class AudioAccessService extends Service {
         }
 
         @Override
-        public byte[] readAudio(int clientId, int frames, boolean waitForData) {
+        public byte[] readAudio(int clientId, int frames) {
             enforceClientOwner(clientId);
             if (!AudioSession.PCM.isActive()) {
                 return null;
             }
-            return AudioSession.PCM.read(clientId, frames, waitForData);
+            return AudioSession.PCM.read(clientId, frames);
         }
 
         @Override

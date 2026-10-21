@@ -9,6 +9,7 @@ import java.util.Map;
 
 final class PcmRingBuffer {
     static final int OUTPUT_RATE = 48000;
+    private static final int PREBUFFER_FRAMES = OUTPUT_RATE / 5;
     private static final int CAPACITY_FRAMES = OUTPUT_RATE * 6;
     private static final int BYTES_PER_FRAME = 4;
 
@@ -65,7 +66,8 @@ final class PcmRingBuffer {
         if (!active || token != generation || pcm == null || pcm.length < BYTES_PER_FRAME) {
             return;
         }
-        long deadline = streamStartedAt + writeFrame * 1000L / OUTPUT_RATE;
+        long mediaFrame = Math.max(0, writeFrame - PREBUFFER_FRAMES);
+        long deadline = streamStartedAt + mediaFrame * 1000L / OUTPUT_RATE;
         while (active && token == generation && SystemClock.uptimeMillis() < deadline) {
             long waitMs = deadline - SystemClock.uptimeMillis();
             try {
@@ -102,7 +104,8 @@ final class PcmRingBuffer {
     synchronized int registerClient(int sampleRate, int channels, int encoding) {
         int id = nextClientId++;
         clients.put(id, new Client(Math.max(8000, Math.min(sampleRate, 192000)),
-                Math.max(1, Math.min(channels, 8)), normalizeEncoding(encoding), writeFrame));
+                Math.max(1, Math.min(channels, 8)), normalizeEncoding(encoding),
+                Math.max(baseFrame, writeFrame - PREBUFFER_FRAMES)));
         return id;
     }
 
@@ -110,7 +113,7 @@ final class PcmRingBuffer {
         clients.remove(id);
     }
 
-    synchronized byte[] read(int id, int requestedFrames, boolean waitForData) {
+    synchronized byte[] read(int id, int requestedFrames) {
         Client client = clients.get(id);
         if (client == null || requestedFrames <= 0 || requestedFrames > 16384 || !active) {
             return new byte[0];
@@ -118,48 +121,19 @@ final class PcmRingBuffer {
         if (client.position < baseFrame) {
             client.position = baseFrame;
         }
-        if (waitForData) {
-            long timeoutMs = Math.min(500L, Math.max(50L,
-                    requestedFrames * 1000L / client.sampleRate + 50L));
-            long deadline = SystemClock.uptimeMillis() + timeoutMs;
-            int available;
-            do {
-                if (client.position < baseFrame) {
-                    client.position = baseFrame;
-                }
-                available = availableFrames(client);
-                if (available >= requestedFrames || finished || !active) {
-                    break;
-                }
-                long waitMs = deadline - SystemClock.uptimeMillis();
-                if (waitMs <= 0) {
-                    break;
-                }
-                try {
-                    wait(Math.min(waitMs, 8));
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            } while (active);
-        }
 
-        if (!active) {
-            return new byte[0];
-        }
         int bytesPerSample = bytesPerSample(client.encoding);
-        int frames = Math.min(requestedFrames, availableFrames(client));
+        int available = availableFrames(client);
+        int frames = Math.min(requestedFrames, available);
         byte[] result = new byte[requestedFrames * client.channels * bytesPerSample];
         if (client.encoding == AudioFormat.ENCODING_PCM_8BIT) {
             Arrays.fill(result, (byte) 0x80);
         }
+        double step = OUTPUT_RATE / (double) client.sampleRate;
         if (frames <= 0) {
-            if (waitForData) {
-                client.position += requestedFrames * (OUTPUT_RATE / (double) client.sampleRate);
-            }
+            client.position += requestedFrames * step;
             return result;
         }
-        double step = OUTPUT_RATE / (double) client.sampleRate;
         int out = 0;
         for (int frame = 0; frame < frames; frame++) {
             double position = client.position;
@@ -183,9 +157,7 @@ final class PcmRingBuffer {
             }
             client.position += step;
         }
-        if (waitForData) {
-            client.position += (requestedFrames - frames) * step;
-        }
+        client.position += (requestedFrames - frames) * step;
         return result;
     }
 

@@ -15,6 +15,7 @@ final class PcmDecoder implements Runnable {
     private final Uri uri;
     private final PcmRingBuffer output;
     private final long generation;
+    private double resamplePhase;
 
     PcmDecoder(Context context, Uri uri, PcmRingBuffer output, long generation) {
         this.context = context.getApplicationContext();
@@ -114,7 +115,7 @@ final class PcmDecoder implements Runnable {
         return -1;
     }
 
-    private static byte[] convertToCanonical(byte[] input, MediaFormat format) {
+    private byte[] convertToCanonical(byte[] input, MediaFormat format) {
         int sampleRate = format.containsKey(MediaFormat.KEY_SAMPLE_RATE)
                 ? format.getInteger(MediaFormat.KEY_SAMPLE_RATE) : PcmRingBuffer.OUTPUT_RATE;
         int channels = format.containsKey(MediaFormat.KEY_CHANNEL_COUNT)
@@ -130,18 +131,20 @@ final class PcmDecoder implements Runnable {
             bytesPerSample = 2;
         }
         channels = Math.max(1, Math.min(channels, 8));
-        sampleRate = Math.max(8000, sampleRate);
+        sampleRate = Math.max(8000, Math.min(192000, sampleRate));
         int inputFrames = input.length / (bytesPerSample * channels);
         if (inputFrames == 0) {
             return new byte[0];
         }
-        int outputFrames = Math.max(1, (int) ((long) inputFrames * PcmRingBuffer.OUTPUT_RATE / sampleRate));
+        double phase = resamplePhase;
+        double step = sampleRate / (double) PcmRingBuffer.OUTPUT_RATE;
+        int outputFrames = Math.max(1,
+                (int) Math.ceil((inputFrames - phase) / step));
         byte[] result = new byte[outputFrames * 4];
         ByteBuffer source = ByteBuffer.wrap(input).order(ByteOrder.LITTLE_ENDIAN);
         ByteBuffer target = ByteBuffer.wrap(result).order(ByteOrder.LITTLE_ENDIAN);
-        double step = sampleRate / (double) PcmRingBuffer.OUTPUT_RATE;
         for (int frame = 0; frame < outputFrames; frame++) {
-            double position = frame * step;
+            double position = phase + frame * step;
             int first = Math.min((int) position, inputFrames - 1);
             int second = Math.min(first + 1, inputFrames - 1);
             double fraction = position - first;
@@ -156,6 +159,7 @@ final class PcmDecoder implements Runnable {
             target.putShort(outLeft);
             target.putShort(outRight);
         }
+        resamplePhase = phase + outputFrames * step - inputFrames;
         return result;
     }
 

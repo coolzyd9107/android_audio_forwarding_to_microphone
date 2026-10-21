@@ -13,8 +13,10 @@ import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.WeakHashMap;
+import java.util.concurrent.locks.LockSupport;
 
 import io.github.libxposed.api.XposedInterface.ExceptionMode;
 import io.github.libxposed.api.XposedModule;
@@ -25,6 +27,7 @@ public final class AudioRecordHook extends XposedModule {
     private static final String MODULE_PACKAGE = "com.coolzyd.audioforwarder";
     private static final Object LOCK = new Object();
     private static final Map<AudioRecord, Integer> CLIENTS = new WeakHashMap<>();
+    private static final Map<AudioRecord, ReadClock> READ_CLOCKS = new WeakHashMap<>();
     private static volatile IForwardingAudio remote;
     private static volatile Context appContext;
     private static volatile boolean lastKnownForwarding;
@@ -134,6 +137,7 @@ public final class AudioRecordHook extends XposedModule {
                     Integer clientId;
                     synchronized (LOCK) {
                         clientId = CLIENTS.remove((AudioRecord) chain.getThisObject());
+                        READ_CLOCKS.remove((AudioRecord) chain.getThisObject());
                     }
                     IForwardingAudio service = remote;
                     if (clientId != null && service != null) {
@@ -172,7 +176,8 @@ public final class AudioRecordHook extends XposedModule {
                         return result;
                     }
                     lastKnownForwarding = false;
-                    return chain.proceed();
+                    request.fillSilence();
+                    return request.returnCount;
                 }
 
                 if (service != null) {
@@ -198,7 +203,8 @@ public final class AudioRecordHook extends XposedModule {
                 Integer result = readForwarded(record, request, service, clientId);
                 if (result == null) {
                     lastKnownForwarding = false;
-                    return chain.proceed();
+                    request.fillSilence();
+                    return request.returnCount;
                 }
                 return result;
             });
@@ -225,8 +231,10 @@ public final class AudioRecordHook extends XposedModule {
             int frames = request.frames(channels);
             if (frames <= 0 || frames > 16384) {
                 request.fillSilence();
+                paceBlockingRead(record, request, sampleRate, Math.max(0, frames));
                 return request.returnCount;
             }
+            paceBlockingRead(record, request, sampleRate, frames);
             if (service == null) {
                 request.fillSilence();
                 return request.returnCount;
@@ -237,9 +245,11 @@ public final class AudioRecordHook extends XposedModule {
                     CLIENTS.put(record, clientId);
                 }
             }
-            byte[] pcm = service.readAudio(clientId, frames, request.blocking);
+            byte[] pcm = service.readAudio(clientId, frames);
             if (pcm == null) {
-                return null;
+                request.fillSilence();
+                lastKnownForwarding = false;
+                return request.returnCount;
             }
             request.write(pcm, frames, channels);
             return request.returnCount;
@@ -247,6 +257,42 @@ public final class AudioRecordHook extends XposedModule {
             log(android.util.Log.WARN, "AudioForwarder", "Forwarded read failed; returning silence", error);
             request.fillSilence();
             return request.returnCount;
+        }
+    }
+
+    private static void paceBlockingRead(AudioRecord record, ReadRequest request,
+                                         int sampleRate, int frames) {
+        if (!request.blocking || frames <= 0) {
+            return;
+        }
+        long durationNanos = Math.max(1L, frames * 1_000_000_000L / sampleRate);
+        long deadline;
+        synchronized (LOCK) {
+            long now = System.nanoTime();
+            ReadClock clock = READ_CLOCKS.get(record);
+            if (clock == null || clock.sampleRate != sampleRate || clock.nextDeadline < now - durationNanos) {
+                clock = new ReadClock(sampleRate, now);
+                READ_CLOCKS.put(record, clock);
+            }
+            deadline = clock.nextDeadline + durationNanos;
+            clock.nextDeadline = deadline;
+        }
+        long remaining;
+        while ((remaining = deadline - System.nanoTime()) > 0) {
+            LockSupport.parkNanos(remaining);
+            if (Thread.currentThread().isInterrupted()) {
+                return;
+            }
+        }
+    }
+
+    private static final class ReadClock {
+        final int sampleRate;
+        long nextDeadline;
+
+        ReadClock(int sampleRate, long nextDeadline) {
+            this.sampleRate = sampleRate;
+            this.nextDeadline = nextDeadline;
         }
     }
 
@@ -299,7 +345,6 @@ public final class AudioRecordHook extends XposedModule {
         final Object buffer;
         final int offset;
         final int size;
-        final boolean blocking;
         int encoding;
         final int returnCount;
 
@@ -392,10 +437,12 @@ public final class AudioRecordHook extends XposedModule {
                 for (int i = 0; i < sampleCount; i++) target[offset + i] = source.getFloat();
                 Arrays.fill(target, offset + sampleCount, offset + size, 0.0f);
             } else if (buffer instanceof ByteBuffer) {
-                ByteBuffer target = ((ByteBuffer) buffer).duplicate().order(ByteOrder.LITTLE_ENDIAN);
+                ByteBuffer direct = (ByteBuffer) buffer;
+                ByteBuffer target = direct.duplicate().order(ByteOrder.LITTLE_ENDIAN);
                 target.position(offset);
                 target.put(pcm, 0, completeBytes);
                 for (int i = completeBytes; i < size; i++) target.put((byte) 0);
+                direct.position(offset + size);
             }
         }
 
@@ -407,9 +454,11 @@ public final class AudioRecordHook extends XposedModule {
             } else if (buffer instanceof float[]) {
                 Arrays.fill((float[]) buffer, offset, offset + size, 0.0f);
             } else if (buffer instanceof ByteBuffer) {
-                ByteBuffer target = ((ByteBuffer) buffer).duplicate();
+                ByteBuffer direct = (ByteBuffer) buffer;
+                ByteBuffer target = direct.duplicate();
                 target.position(offset);
                 for (int i = 0; i < size; i++) target.put((byte) 0);
+                direct.position(offset + size);
             }
         }
 
