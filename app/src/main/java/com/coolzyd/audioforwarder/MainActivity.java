@@ -116,7 +116,7 @@ public final class MainActivity extends Activity {
         root.addView(stop, matchWrap());
 
         TextView moduleNote = new TextView(this);
-        moduleNote.setText("首次使用：在 LSPosed 中启用模块，并将需要使用麦克风的应用加入作用域。");
+        moduleNote.setText("首次使用：在 libxposed 管理器中启用模块并配置作用域；支持 AudioRecord 的应用可加入作用域。");
         moduleNote.setTextSize(13);
         moduleNote.setPadding(0, dp(20), 0, 0);
         root.addView(moduleNote, matchWrap());

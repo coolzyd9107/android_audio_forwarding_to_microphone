@@ -9,7 +9,7 @@ Push to `main`/`master`, open a pull request, or run the `Android Audio Forwarde
 ## Install and use
 
 1. Install the APK in a libxposed API 102-compatible framework and enable **Audio Forwarder**.
-2. Add the apps that need microphone input to the module scope. The hook is generic and acts on the Android `AudioRecord` framework API; it does not contain app-specific hooks.
+2. The module declares QQ (`com.tencent.mobileqq`) and Honor of Kings (`com.tencent.tmgp.sgame`) as recommended default scopes. Because `staticScope=false`, add or remove any microphone-capturing apps in the framework manager as needed; the hook implementation remains generic and does not contain per-app logic.
 3. Open Audio Forwarder, choose an audio file, optionally enable audible media playback, then start forwarding.
 4. Grant microphone permission to the receiving app as usual. Stop forwarding from the app or its notification.
 
@@ -17,7 +17,7 @@ The media checkbox controls only local playback. The selected file is still sent
 
 The mic forwarding gain is an independent 0–200% control. At 0% the injected signal is silent; the optional local player uses normal Android media output and follows the device's media volume without changing the forwarding gain.
 
-The exported Binder endpoint only serves registered clients that hold Android's microphone permission. Playback controls remain in a non-exported service.
+The Xposed API 102 scope is declared in `app/src/main/resources/META-INF/xposed/scope.list`. This list supplies recommended defaults to the manager; `staticScope=false` keeps the scope editable. `AudioRecord.read()` is called in the capturing app process. `AudioService` in system_server handles control and routing, not the PCM samples, so hooking it alone cannot replace microphone audio.
 
 ## Compatibility
 
