@@ -9,7 +9,7 @@ import java.util.Map;
 
 final class PcmRingBuffer {
     static final int OUTPUT_RATE = 48000;
-    private static final int PREBUFFER_FRAMES = OUTPUT_RATE / 5;
+    private static final int PREBUFFER_FRAMES = OUTPUT_RATE * 2;
     private static final int CAPACITY_FRAMES = OUTPUT_RATE * 6;
     private static final int BYTES_PER_FRAME = 4;
 

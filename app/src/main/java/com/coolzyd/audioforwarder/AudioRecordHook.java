@@ -345,6 +345,7 @@ public final class AudioRecordHook extends XposedModule {
         final Object buffer;
         final int offset;
         final int size;
+        final boolean blocking;
         int encoding;
         final int returnCount;
 
