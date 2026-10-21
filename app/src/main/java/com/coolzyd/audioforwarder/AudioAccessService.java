@@ -11,7 +11,18 @@ public final class AudioAccessService extends Service {
     private final IForwardingAudio.Stub binder = new IForwardingAudio.Stub() {
         @Override
         public boolean isForwarding() {
-            return AudioSession.PCM.isActive();
+            if (!AudioSession.PCM.isActive()) {
+                return false;
+            }
+            String targetPackage = AudioSession.targetPackage;
+            if (targetPackage == null) {
+                return false;
+            }
+            try {
+                return getPackageManager().getApplicationInfo(targetPackage, 0).uid == Binder.getCallingUid();
+            } catch (PackageManager.NameNotFoundException e) {
+                return false;
+            }
         }
 
         @Override

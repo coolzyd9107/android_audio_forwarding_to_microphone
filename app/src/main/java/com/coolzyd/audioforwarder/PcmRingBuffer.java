@@ -21,18 +21,20 @@ final class PcmRingBuffer {
     private long streamStartedAt;
     private int sourceSampleRate = DEFAULT_SOURCE_RATE;
     private int capacityFrames = DEFAULT_SOURCE_RATE * CAPACITY_SECONDS;
+    private boolean liveSource;
     private boolean active;
     private boolean finished;
     private float gain = 1.0f;
     private int nextClientId = 1;
 
-    synchronized long beginStream() {
+    synchronized long beginStream(boolean live) {
         generation++;
         baseFrame = 0;
         writeFrame = 0;
         streamStartedAt = SystemClock.uptimeMillis();
         active = true;
         finished = false;
+        liveSource = live;
         setSourceRate(DEFAULT_SOURCE_RATE);
         for (Client client : clients.values()) {
             client.position = 0;
@@ -93,15 +95,17 @@ final class PcmRingBuffer {
         if (!active || token != generation || pcm == null || pcm.length < BYTES_PER_FRAME) {
             return;
         }
-        long mediaFrame = Math.max(0, writeFrame - sourceSampleRate * PREBUFFER_SECONDS);
-        long deadline = streamStartedAt + mediaFrame * 1000L / sourceSampleRate;
-        while (active && token == generation && SystemClock.uptimeMillis() < deadline) {
-            long waitMs = deadline - SystemClock.uptimeMillis();
-            try {
-                wait(Math.max(1, Math.min(waitMs, 100)));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return;
+        if (!liveSource) {
+            long mediaFrame = Math.max(0, writeFrame - sourceSampleRate * PREBUFFER_SECONDS);
+            long deadline = streamStartedAt + mediaFrame * 1000L / sourceSampleRate;
+            while (active && token == generation && SystemClock.uptimeMillis() < deadline) {
+                long waitMs = deadline - SystemClock.uptimeMillis();
+                try {
+                    wait(Math.max(1, Math.min(waitMs, 100)));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
             }
         }
         if (!active || token != generation) {
@@ -130,9 +134,11 @@ final class PcmRingBuffer {
 
     synchronized int registerClient(int sampleRate, int channels, int encoding) {
         int id = nextClientId++;
+        long initialPosition = liveSource ? writeFrame
+                : Math.max(baseFrame, writeFrame - sourceSampleRate * PREBUFFER_SECONDS);
         clients.put(id, new Client(Math.max(8000, Math.min(sampleRate, 192000)),
                 Math.max(1, Math.min(channels, 8)), normalizeEncoding(encoding),
-                Math.max(baseFrame, writeFrame - sourceSampleRate * PREBUFFER_SECONDS), sourceSampleRate));
+                initialPosition, sourceSampleRate));
         return id;
     }
 

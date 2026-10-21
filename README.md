@@ -1,6 +1,6 @@
 # Android Audio Forwarder
 
-This project is an Android audio player and a libxposed API 102 module. It decodes a selected audio file to PCM and, while forwarding is active, replaces samples returned by Android's Java `AudioRecord.read()` APIs. Media playback through the phone's normal output is optional.
+This project is an Android audio forwarder and a libxposed API 102 module. It supports local audio files and Android's app playback capture as sources, forwarding PCM to a selected app's Java `AudioRecord.read()` capture stream.
 
 ## Build
 
@@ -9,11 +9,11 @@ Push to `main`/`master`, open a pull request, or run the `Android Audio Forwarde
 ## Install and use
 
 1. Install the APK in a libxposed API 102-compatible framework and enable **Audio Forwarder**.
-2. The module declares QQ (`com.tencent.mobileqq`) and Honor of Kings (`com.tencent.tmgp.sgame`) as recommended default scopes. Because `staticScope=false`, add or remove any microphone-capturing apps in the framework manager as needed; the hook implementation remains generic and does not contain per-app logic.
-3. Open Audio Forwarder, choose an audio file, optionally enable audible media playback, then start forwarding.
-4. Grant microphone permission to the receiving app as usual. Stop forwarding from the app or its notification.
+2. `scope.list` recommends QQ and Honor of Kings. Add the selected target application to the module scope in the libxposed manager, then open Audio Forwarder.
+3. Choose **Local file** or **App audio**. For app audio, select the music source and microphone target, grant the system capture prompt, then start forwarding.
+4. The target app still needs Android microphone permission. Stop forwarding from the app or its notification.
 
-Decoded audio stays at its source sample rate until the capture stream is read. The final conversion uses a windowed-sinc polyphase low-pass filter, which suppresses aliasing when the target microphone format has a lower sample rate (for example, 48 kHz music into a 16 kHz voice capture stream).
+The app-source mode receives PCM from Android's playback capture pipeline. It does not hook the source music app or read its internal decoder buffer. Android captures the app's rendered output, which may already include source-app/system processing; the target app can also re-encode voice recordings at a lower bitrate. The source must use a capturable playback usage (`MEDIA`, `GAME`, or `UNKNOWN`) and allow capture; Android or the source app may deny it. Captured source audio remains audible according to the source app/system policy. Capture is 48 kHz stereo PCM16; conversion is only applied as required by the target `AudioRecord` format.
 
 The mic forwarding gain is an independent 0–200% control. At 0% the injected signal is silent; the optional local player uses normal Android media output and follows the device's media volume without changing the forwarding gain.
 
