@@ -1,7 +1,8 @@
 package com.coolzyd.audioforwarder;
 
 interface IForwardingAudio {
+    boolean isForwarding();
     int registerClient(int sampleRate, int channels, int encoding);
-    byte[] readAudio(int clientId, int frames);
+    byte[] readAudio(int clientId, int frames, boolean waitForData);
     void unregisterClient(int clientId);
 }

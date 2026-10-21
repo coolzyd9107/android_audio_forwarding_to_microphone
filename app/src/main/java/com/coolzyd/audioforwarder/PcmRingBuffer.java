@@ -110,44 +110,54 @@ final class PcmRingBuffer {
         clients.remove(id);
     }
 
-    synchronized byte[] read(int id, int requestedFrames) {
+    synchronized byte[] read(int id, int requestedFrames, boolean waitForData) {
         Client client = clients.get(id);
-        if (client == null || requestedFrames <= 0 || requestedFrames > 8192 || !active) {
+        if (client == null || requestedFrames <= 0 || requestedFrames > 16384 || !active) {
             return new byte[0];
         }
-        long deadline = SystemClock.uptimeMillis() + 30;
-        int available;
-        do {
-            if (client.position < baseFrame) {
-                client.position = baseFrame;
-            }
-            available = availableFrames(client);
-            if (available >= requestedFrames || finished || !active) {
-                break;
-            }
-            long waitMs = deadline - SystemClock.uptimeMillis();
-            if (waitMs <= 0) {
-                break;
-            }
-            try {
-                wait(Math.min(waitMs, 8));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-        } while (active);
+        if (client.position < baseFrame) {
+            client.position = baseFrame;
+        }
+        if (waitForData) {
+            long timeoutMs = Math.min(500L, Math.max(50L,
+                    requestedFrames * 1000L / client.sampleRate + 50L));
+            long deadline = SystemClock.uptimeMillis() + timeoutMs;
+            int available;
+            do {
+                if (client.position < baseFrame) {
+                    client.position = baseFrame;
+                }
+                available = availableFrames(client);
+                if (available >= requestedFrames || finished || !active) {
+                    break;
+                }
+                long waitMs = deadline - SystemClock.uptimeMillis();
+                if (waitMs <= 0) {
+                    break;
+                }
+                try {
+                    wait(Math.min(waitMs, 8));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            } while (active);
+        }
 
         if (!active) {
             return new byte[0];
         }
         int bytesPerSample = bytesPerSample(client.encoding);
         int frames = Math.min(requestedFrames, availableFrames(client));
-        if (frames <= 0) {
-            return new byte[requestedFrames * client.channels * bytesPerSample];
-        }
         byte[] result = new byte[requestedFrames * client.channels * bytesPerSample];
         if (client.encoding == AudioFormat.ENCODING_PCM_8BIT) {
             Arrays.fill(result, (byte) 0x80);
+        }
+        if (frames <= 0) {
+            if (waitForData) {
+                client.position += requestedFrames * (OUTPUT_RATE / (double) client.sampleRate);
+            }
+            return result;
         }
         double step = OUTPUT_RATE / (double) client.sampleRate;
         int out = 0;
@@ -172,6 +182,9 @@ final class PcmRingBuffer {
                 out = writeSample(result, out, sample, client.encoding);
             }
             client.position += step;
+        }
+        if (waitForData) {
+            client.position += (requestedFrames - frames) * step;
         }
         return result;
     }

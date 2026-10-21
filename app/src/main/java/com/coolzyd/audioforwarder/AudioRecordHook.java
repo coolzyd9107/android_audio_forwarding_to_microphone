@@ -12,12 +12,12 @@ import android.os.IBinder;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.util.Arrays;
 import java.util.Map;
 import java.util.WeakHashMap;
 
 import io.github.libxposed.api.XposedInterface.ExceptionMode;
 import io.github.libxposed.api.XposedModule;
+import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam;
 import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam;
 
 public final class AudioRecordHook extends XposedModule {
@@ -26,9 +26,11 @@ public final class AudioRecordHook extends XposedModule {
     private static final Map<AudioRecord, Integer> CLIENTS = new WeakHashMap<>();
     private static volatile IForwardingAudio remote;
     private static volatile Context appContext;
+    private static volatile boolean lastKnownForwarding;
     private static boolean binding;
 
     private boolean hooksInstalled;
+    private boolean attachHookInstalled;
 
     private static final ServiceConnection CONNECTION = new ServiceConnection() {
         @Override
@@ -64,12 +66,31 @@ public final class AudioRecordHook extends XposedModule {
     };
 
     @Override
+    public void onPackageLoaded(PackageLoadedParam param) {
+        if (MODULE_PACKAGE.equals(param.getPackageName())) {
+            return;
+        }
+        installAttachHook();
+        installAudioHooks();
+    }
+
+    @Override
     public void onPackageReady(PackageReadyParam param) {
-        if (hooksInstalled || MODULE_PACKAGE.equals(param.getPackageName())) {
+        if (MODULE_PACKAGE.equals(param.getPackageName())) {
+            return;
+        }
+        installAudioHooks();
+        Context context = resolveApplicationContext();
+        if (context != null) {
+            bindAccessService(context);
+        }
+    }
+
+    private void installAudioHooks() {
+        if (hooksInstalled) {
             return;
         }
         hooksInstalled = true;
-        hookApplicationAttach();
         hookRead("read", byte[].class, int.class, int.class);
         hookRead("read", byte[].class, int.class, int.class, int.class);
         hookRead("read", short[].class, int.class, int.class);
@@ -80,15 +101,21 @@ public final class AudioRecordHook extends XposedModule {
         hookRelease();
     }
 
-    private void hookApplicationAttach() {
+    private void installAttachHook() {
+        if (attachHookInstalled) {
+            return;
+        }
+        attachHookInstalled = true;
         try {
             Method attach = Application.class.getDeclaredMethod("attach", Context.class);
             hook(attach).setExceptionMode(ExceptionMode.PROTECTIVE).intercept(chain -> {
                 Object result = chain.proceed();
-                Object application = chain.getThisObject();
-                if (application instanceof Application) {
-                    Context context = ((Application) application).getApplicationContext();
-                    appContext = context != null ? context : (Application) application;
+                Object context = chain.getArg(0);
+                if (context instanceof Context) {
+                    Object application = chain.getThisObject();
+                    Context app = application instanceof Application
+                            ? ((Application) application).getApplicationContext() : null;
+                    bindAccessService(app != null ? app : (Context) context);
                 }
                 return result;
             });
@@ -126,14 +153,51 @@ public final class AudioRecordHook extends XposedModule {
         try {
             Method method = AudioRecord.class.getMethod(name, parameterTypes);
             hook(method).setExceptionMode(ExceptionMode.PROTECTIVE).intercept(chain -> {
-                Object result = chain.proceed();
-                if (chain.getThisObject() instanceof AudioRecord && result instanceof Integer
-                        && (Integer) result > 0) {
-                    try {
-                        inject((AudioRecord) chain.getThisObject(), chain.getArgs().toArray(), (Integer) result);
-                    } catch (Throwable error) {
-                        log(android.util.Log.WARN, "AudioForwarder", "Audio injection failed", error);
+                IForwardingAudio service = remote;
+                boolean forwarding = lastKnownForwarding;
+                AudioRecord record = (AudioRecord) chain.getThisObject();
+                Integer clientId;
+                synchronized (LOCK) {
+                    clientId = CLIENTS.get(record);
+                }
+
+                if (service != null && forwarding && clientId != null) {
+                    ReadRequest request = ReadRequest.from(chain.getArgs().toArray());
+                    if (request == null) {
+                        return 0;
                     }
+                    Integer result = readForwarded(record, request, service, clientId);
+                    if (result != null) {
+                        return result;
+                    }
+                    lastKnownForwarding = false;
+                    return chain.proceed();
+                }
+
+                if (service != null) {
+                    try {
+                        forwarding = service.isForwarding();
+                        lastKnownForwarding = forwarding;
+                    } catch (Throwable error) {
+                        log(android.util.Log.WARN, "AudioForwarder", "Forwarding state unavailable", error);
+                    }
+                } else {
+                    Context context = resolveApplicationContext();
+                    if (context != null) {
+                        bindAccessService(context);
+                    }
+                }
+                if (!forwarding) {
+                    return chain.proceed();
+                }
+                ReadRequest request = ReadRequest.from(chain.getArgs().toArray());
+                if (request == null) {
+                    return 0;
+                }
+                Integer result = readForwarded(record, request, service, clientId);
+                if (result == null) {
+                    lastKnownForwarding = false;
+                    return chain.proceed();
                 }
                 return result;
             });
@@ -144,112 +208,220 @@ public final class AudioRecordHook extends XposedModule {
         }
     }
 
-    private static void inject(AudioRecord record, Object[] args, int result) throws Exception {
-        int channels = Math.max(1, record.getChannelCount());
-        int sampleRate = Math.max(8000, record.getSampleRate());
-        int encoding = record.getAudioFormat();
-        if (encoding != AudioFormat.ENCODING_PCM_FLOAT && encoding != AudioFormat.ENCODING_PCM_8BIT) {
-            encoding = AudioFormat.ENCODING_PCM_16BIT;
+    private Integer readForwarded(AudioRecord record, ReadRequest request, IForwardingAudio service,
+                                  Integer clientId) {
+        try {
+            int channels = Math.max(1, Math.min(8, record.getChannelCount()));
+            int encoding = request.encoding;
+            if (request.buffer instanceof byte[] || request.buffer instanceof ByteBuffer) {
+                int deviceEncoding = record.getAudioFormat();
+                encoding = deviceEncoding == AudioFormat.ENCODING_PCM_8BIT
+                        || deviceEncoding == AudioFormat.ENCODING_PCM_FLOAT
+                        ? deviceEncoding : AudioFormat.ENCODING_PCM_16BIT;
+                request.encoding = encoding;
+            }
+            int sampleRate = Math.max(8000, record.getSampleRate());
+            int frames = request.frames(channels);
+            if (frames <= 0 || frames > 16384) {
+                request.fillSilence();
+                return request.returnCount;
+            }
+            if (service == null) {
+                request.fillSilence();
+                return request.returnCount;
+            }
+            if (clientId == null) {
+                clientId = service.registerClient(sampleRate, channels, encoding);
+                synchronized (LOCK) {
+                    CLIENTS.put(record, clientId);
+                }
+            }
+            byte[] pcm = service.readAudio(clientId, frames, request.blocking);
+            if (pcm == null) {
+                return null;
+            }
+            request.write(pcm, frames, channels);
+            return request.returnCount;
+        } catch (Throwable error) {
+            log(android.util.Log.WARN, "AudioForwarder", "Forwarded read failed; returning silence", error);
+            request.fillSilence();
+            return request.returnCount;
         }
-        int bytesPerSample = bytesPerSample(encoding);
-        int frames;
-        if (args[0] instanceof byte[]) {
-            frames = result / (channels * bytesPerSample);
-        } else if (args[0] instanceof short[]) {
-            encoding = AudioFormat.ENCODING_PCM_16BIT;
-            bytesPerSample = 2;
-            frames = result / channels;
-        } else if (args[0] instanceof float[]) {
-            encoding = AudioFormat.ENCODING_PCM_FLOAT;
-            bytesPerSample = 4;
-            frames = result / channels;
-        } else if (args[0] instanceof ByteBuffer) {
-            frames = result / (channels * bytesPerSample);
-        } else {
+    }
+
+    private static void bindAccessService(Context context) {
+        if (context == null) {
             return;
         }
-        if (frames <= 0 || frames > 8192) {
-            return;
+        Context applicationContext = context.getApplicationContext();
+        if (applicationContext != null) {
+            context = applicationContext;
+        }
+        appContext = context;
+        synchronized (LOCK) {
+            if (remote != null || binding) {
+                return;
+            }
+            Intent intent = new Intent().setComponent(new ComponentName(MODULE_PACKAGE,
+                    MODULE_PACKAGE + ".AudioAccessService"));
+            try {
+                binding = context.bindService(intent, CONNECTION, Context.BIND_AUTO_CREATE);
+            } catch (SecurityException | IllegalStateException error) {
+                binding = false;
+            }
+        }
+    }
+
+    private static Context resolveApplicationContext() {
+        Context context = appContext;
+        if (context != null) {
+            return context;
+        }
+        try {
+            Class<?> activityThread = Class.forName("android.app.ActivityThread");
+            Method currentApplication = activityThread.getDeclaredMethod("currentApplication");
+            currentApplication.setAccessible(true);
+            Object application = currentApplication.invoke(null);
+            if (application instanceof Application) {
+                context = ((Application) application).getApplicationContext();
+                if (context != null) {
+                    appContext = context;
+                    return context;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private static final class ReadRequest {
+        final Object buffer;
+        final int offset;
+        final int size;
+        final boolean blocking;
+        int encoding;
+        final int returnCount;
+
+        private ReadRequest(Object buffer, int offset, int size, boolean blocking,
+                            int encoding, int returnCount) {
+            this.buffer = buffer;
+            this.offset = offset;
+            this.size = size;
+            this.blocking = blocking;
+            this.encoding = encoding;
+            this.returnCount = returnCount;
         }
 
-        IForwardingAudio service = connectIfNeeded();
-        if (service == null) {
-            return;
-        }
-        Integer clientId;
-        synchronized (LOCK) {
-            clientId = CLIENTS.get(record);
-        }
-        if (clientId == null) {
-            int created = service.registerClient(sampleRate, channels, encoding);
-            synchronized (LOCK) {
-                CLIENTS.put(record, created);
+        static ReadRequest from(Object[] args) {
+            if (args.length < 2 || !(args[1] instanceof Integer)) {
+                return null;
             }
-            clientId = created;
+            Object buffer = args[0];
+            int offset = 0;
+            int size;
+            int encoding;
+            int returnCount;
+            if (buffer instanceof byte[]) {
+                if (args.length < 3 || !(args[2] instanceof Integer)) return null;
+                offset = (Integer) args[1];
+                size = (Integer) args[2];
+                encoding = AudioFormat.ENCODING_PCM_16BIT;
+                returnCount = size;
+                if (offset < 0 || size < 0 || size > ((byte[]) buffer).length - offset) return null;
+            } else if (buffer instanceof short[]) {
+                if (args.length < 3 || !(args[2] instanceof Integer)) return null;
+                offset = (Integer) args[1];
+                size = (Integer) args[2];
+                encoding = AudioFormat.ENCODING_PCM_16BIT;
+                returnCount = size;
+                if (offset < 0 || size < 0 || size > ((short[]) buffer).length - offset) return null;
+            } else if (buffer instanceof float[]) {
+                if (args.length < 3 || !(args[2] instanceof Integer)) return null;
+                offset = (Integer) args[1];
+                size = (Integer) args[2];
+                encoding = AudioFormat.ENCODING_PCM_FLOAT;
+                returnCount = size;
+                if (offset < 0 || size < 0 || size > ((float[]) buffer).length - offset) return null;
+            } else if (buffer instanceof ByteBuffer) {
+                size = (Integer) args[1];
+                encoding = AudioFormat.ENCODING_PCM_16BIT;
+                returnCount = size;
+                if (size < 0 || !((ByteBuffer) buffer).isDirect()
+                        || size > ((ByteBuffer) buffer).limit() - ((ByteBuffer) buffer).position()) {
+                    return null;
+                }
+                offset = ((ByteBuffer) buffer).position();
+            } else {
+                return null;
+            }
+            boolean blocking = args.length < 4 || !(args[args.length - 1] instanceof Integer)
+                    || (Integer) args[args.length - 1] == AudioRecord.READ_BLOCKING;
+            if (args.length == 3 && buffer instanceof ByteBuffer && args[2] instanceof Integer) {
+                blocking = (Integer) args[2] == AudioRecord.READ_BLOCKING;
+            }
+            return new ReadRequest(buffer, offset, size, blocking, encoding, returnCount);
         }
-        byte[] pcm = service.readAudio(clientId, frames);
-        int completeBytes = frames * channels * bytesPerSample;
-        if (pcm == null || pcm.length < completeBytes) {
-            return;
+
+        int frames(int channels) {
+            if (buffer instanceof byte[] || buffer instanceof ByteBuffer) {
+                return size / (channels * bytesPerSample(encoding));
+            }
+            return size / channels;
         }
-        if (args[0] instanceof byte[]) {
-            byte[] target = (byte[]) args[0];
-            int offset = (Integer) args[1];
-            System.arraycopy(pcm, 0, target, offset, completeBytes);
-            int trailingBytes = result - completeBytes;
-            if (trailingBytes > 0) {
-                Arrays.fill(target, offset + completeBytes, offset + result,
+
+        void write(byte[] pcm, int frames, int channels) {
+            int sampleCount = frames * channels;
+            int completeBytes = sampleCount * bytesPerSample(encoding);
+            if (pcm == null || pcm.length < completeBytes) {
+                fillSilence();
+                return;
+            }
+            if (buffer instanceof byte[]) {
+                byte[] target = (byte[]) buffer;
+                System.arraycopy(pcm, 0, target, offset, completeBytes);
+                fillTrailingBytes(target, offset + completeBytes, size - completeBytes, encoding);
+            } else if (buffer instanceof short[]) {
+                short[] target = (short[]) buffer;
+                ByteBuffer source = ByteBuffer.wrap(pcm).order(ByteOrder.LITTLE_ENDIAN);
+                for (int i = 0; i < sampleCount; i++) target[offset + i] = source.getShort();
+                Arrays.fill(target, offset + sampleCount, offset + size, (short) 0);
+            } else if (buffer instanceof float[]) {
+                float[] target = (float[]) buffer;
+                ByteBuffer source = ByteBuffer.wrap(pcm).order(ByteOrder.LITTLE_ENDIAN);
+                for (int i = 0; i < sampleCount; i++) target[offset + i] = source.getFloat();
+                Arrays.fill(target, offset + sampleCount, offset + size, 0.0f);
+            } else if (buffer instanceof ByteBuffer) {
+                ByteBuffer target = ((ByteBuffer) buffer).duplicate().order(ByteOrder.LITTLE_ENDIAN);
+                target.position(offset);
+                target.put(pcm, 0, completeBytes);
+                for (int i = completeBytes; i < size; i++) target.put((byte) 0);
+            }
+        }
+
+        void fillSilence() {
+            if (buffer instanceof byte[]) {
+                fillTrailingBytes((byte[]) buffer, offset, size, encoding);
+            } else if (buffer instanceof short[]) {
+                Arrays.fill((short[]) buffer, offset, offset + size, (short) 0);
+            } else if (buffer instanceof float[]) {
+                Arrays.fill((float[]) buffer, offset, offset + size, 0.0f);
+            } else if (buffer instanceof ByteBuffer) {
+                ByteBuffer target = ((ByteBuffer) buffer).duplicate();
+                target.position(offset);
+                for (int i = 0; i < size; i++) target.put((byte) 0);
+            }
+        }
+
+        private static void fillTrailingBytes(byte[] target, int offset, int count, int encoding) {
+            if (count > 0) {
+                Arrays.fill(target, offset, offset + count,
                         encoding == AudioFormat.ENCODING_PCM_8BIT ? (byte) 0x80 : (byte) 0);
             }
-        } else if (args[0] instanceof short[]) {
-            short[] target = (short[]) args[0];
-            int offset = (Integer) args[1];
-            ByteBuffer source = ByteBuffer.wrap(pcm).order(ByteOrder.LITTLE_ENDIAN);
-            for (int i = 0; i < frames * channels; i++) {
-                target[offset + i] = source.getShort();
-            }
-        } else if (args[0] instanceof float[]) {
-            float[] target = (float[]) args[0];
-            int offset = (Integer) args[1];
-            ByteBuffer source = ByteBuffer.wrap(pcm).order(ByteOrder.LITTLE_ENDIAN);
-            for (int i = 0; i < frames * channels; i++) {
-                target[offset + i] = source.getFloat();
-            }
-        } else if (args[0] instanceof ByteBuffer) {
-            ByteBuffer target = ((ByteBuffer) args[0]).duplicate();
-            target.order(ByteOrder.LITTLE_ENDIAN);
-            if (completeBytes <= target.limit()) {
-                target.put(pcm, 0, completeBytes);
-            }
         }
-    }
 
-    private static IForwardingAudio connectIfNeeded() {
-        IForwardingAudio current = remote;
-        if (current != null) {
-            return current;
+        private static int bytesPerSample(int encoding) {
+            if (encoding == AudioFormat.ENCODING_PCM_FLOAT) return 4;
+            return encoding == AudioFormat.ENCODING_PCM_8BIT ? 1 : 2;
         }
-        Context context = appContext;
-        if (context == null) {
-            return null;
-        }
-        synchronized (LOCK) {
-            if (remote != null) {
-                return remote;
-            }
-            if (!binding) {
-                Intent intent = new Intent().setComponent(new ComponentName(MODULE_PACKAGE,
-                        MODULE_PACKAGE + ".AudioAccessService"));
-                binding = context.bindService(intent, CONNECTION, Context.BIND_AUTO_CREATE);
-            }
-        }
-        return remote;
-    }
-
-    private static int bytesPerSample(int encoding) {
-        if (encoding == AudioFormat.ENCODING_PCM_FLOAT) {
-            return 4;
-        }
-        return encoding == AudioFormat.ENCODING_PCM_8BIT ? 1 : 2;
     }
 }

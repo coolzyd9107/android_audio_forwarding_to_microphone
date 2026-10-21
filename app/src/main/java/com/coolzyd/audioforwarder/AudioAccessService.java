@@ -10,6 +10,11 @@ import android.os.Process;
 public final class AudioAccessService extends Service {
     private final IForwardingAudio.Stub binder = new IForwardingAudio.Stub() {
         @Override
+        public boolean isForwarding() {
+            return AudioSession.PCM.isActive();
+        }
+
+        @Override
         public int registerClient(int sampleRate, int channels, int encoding) {
             enforceMicrophonePermission();
             int id = AudioSession.PCM.registerClient(sampleRate, channels, encoding);
@@ -20,9 +25,12 @@ public final class AudioAccessService extends Service {
         }
 
         @Override
-        public byte[] readAudio(int clientId, int frames) {
+        public byte[] readAudio(int clientId, int frames, boolean waitForData) {
             enforceClientOwner(clientId);
-            return AudioSession.PCM.read(clientId, frames);
+            if (!AudioSession.PCM.isActive()) {
+                return null;
+            }
+            return AudioSession.PCM.read(clientId, frames, waitForData);
         }
 
         @Override
