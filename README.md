@@ -13,7 +13,7 @@ Push to `main`/`master`, open a pull request, or run the `Android Audio Forwarde
 3. Open Audio Forwarder, choose an audio file, optionally enable audible media playback, then start forwarding.
 4. Grant microphone permission to the receiving app as usual. Stop forwarding from the app or its notification.
 
-The producer keeps up to two seconds of decoded PCM ahead in a six-second ring buffer. The hook returns every blocking capture block on a per-stream sample clock (`frames / sampleRate`), without waiting for the decoder. Temporary PCM underruns are filled with silence while the source cursor advances by the same requested duration, keeping audio and recording time aligned.
+Decoded audio stays at its source sample rate until the capture stream is read. The final conversion uses a windowed-sinc polyphase low-pass filter, which suppresses aliasing when the target microphone format has a lower sample rate (for example, 48 kHz music into a 16 kHz voice capture stream).
 
 The mic forwarding gain is an independent 0–200% control. At 0% the injected signal is silent; the optional local player uses normal Android media output and follows the device's media volume without changing the forwarding gain.
 

@@ -221,10 +221,8 @@ public final class AudioRecordHook extends XposedModule {
             int channels = Math.max(1, Math.min(8, record.getChannelCount()));
             int encoding = request.encoding;
             if (request.buffer instanceof byte[] || request.buffer instanceof ByteBuffer) {
-                int deviceEncoding = record.getAudioFormat();
-                encoding = deviceEncoding == AudioFormat.ENCODING_PCM_8BIT
-                        || deviceEncoding == AudioFormat.ENCODING_PCM_FLOAT
-                        ? deviceEncoding : AudioFormat.ENCODING_PCM_16BIT;
+                encoding = supportedEncoding(record.getAudioFormat())
+                        ? record.getAudioFormat() : AudioFormat.ENCODING_PCM_16BIT;
                 request.encoding = encoding;
             }
             int sampleRate = Math.max(8000, record.getSampleRate());
@@ -258,6 +256,14 @@ public final class AudioRecordHook extends XposedModule {
             request.fillSilence();
             return request.returnCount;
         }
+    }
+
+    private static boolean supportedEncoding(int encoding) {
+        return encoding == AudioFormat.ENCODING_PCM_8BIT
+                || encoding == AudioFormat.ENCODING_PCM_16BIT
+                || encoding == AudioFormat.ENCODING_PCM_FLOAT
+                || encoding == AudioFormat.ENCODING_PCM_24BIT_PACKED
+                || encoding == AudioFormat.ENCODING_PCM_32BIT;
     }
 
     private static void paceBlockingRead(AudioRecord record, ReadRequest request,
@@ -471,7 +477,9 @@ public final class AudioRecordHook extends XposedModule {
         }
 
         private static int bytesPerSample(int encoding) {
-            if (encoding == AudioFormat.ENCODING_PCM_FLOAT) return 4;
+            if (encoding == AudioFormat.ENCODING_PCM_FLOAT
+                    || encoding == AudioFormat.ENCODING_PCM_32BIT) return 4;
+            if (encoding == AudioFormat.ENCODING_PCM_24BIT_PACKED) return 3;
             return encoding == AudioFormat.ENCODING_PCM_8BIT ? 1 : 2;
         }
     }

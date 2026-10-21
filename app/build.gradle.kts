@@ -31,5 +31,6 @@ android {
 }
 
 dependencies {
+    testImplementation("junit:junit:4.13.2")
     compileOnly("io.github.libxposed:api:102.0.0")
 }

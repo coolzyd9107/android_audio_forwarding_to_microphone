@@ -15,7 +15,6 @@ final class PcmDecoder implements Runnable {
     private final Uri uri;
     private final PcmRingBuffer output;
     private final long generation;
-    private double resamplePhase;
 
     PcmDecoder(Context context, Uri uri, PcmRingBuffer output, long generation) {
         this.context = context.getApplicationContext();
@@ -36,6 +35,7 @@ final class PcmDecoder implements Runnable {
             }
             extractor.selectTrack(trackIndex);
             MediaFormat inputFormat = extractor.getTrackFormat(trackIndex);
+            updateSourceRate(inputFormat);
             String mime = inputFormat.getString(MediaFormat.KEY_MIME);
             decoder = MediaCodec.createDecoderByType(mime);
             decoder.configure(inputFormat, null, null, 0);
@@ -71,6 +71,7 @@ final class PcmDecoder implements Runnable {
                 int outputIndex = decoder.dequeueOutputBuffer(info, 10000);
                 if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                     pcmFormat = decoder.getOutputFormat();
+                    updateSourceRate(pcmFormat);
                 } else if (outputIndex >= 0) {
                     if (info.size > 0) {
                         ByteBuffer buffer = decoder.getOutputBuffer(outputIndex);
@@ -104,6 +105,12 @@ final class PcmDecoder implements Runnable {
         }
     }
 
+    private void updateSourceRate(MediaFormat format) {
+        if (format.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+            output.setSourceSampleRate(generation, format.getInteger(MediaFormat.KEY_SAMPLE_RATE));
+        }
+    }
+
     private static int findAudioTrack(MediaExtractor extractor) {
         for (int i = 0; i < extractor.getTrackCount(); i++) {
             MediaFormat format = extractor.getTrackFormat(i);
@@ -116,51 +123,38 @@ final class PcmDecoder implements Runnable {
     }
 
     private byte[] convertToCanonical(byte[] input, MediaFormat format) {
-        int sampleRate = format.containsKey(MediaFormat.KEY_SAMPLE_RATE)
-                ? format.getInteger(MediaFormat.KEY_SAMPLE_RATE) : PcmRingBuffer.OUTPUT_RATE;
         int channels = format.containsKey(MediaFormat.KEY_CHANNEL_COUNT)
                 ? format.getInteger(MediaFormat.KEY_CHANNEL_COUNT) : 2;
         int encoding = format.containsKey(MediaFormat.KEY_PCM_ENCODING)
                 ? format.getInteger(MediaFormat.KEY_PCM_ENCODING) : android.media.AudioFormat.ENCODING_PCM_16BIT;
-        int bytesPerSample;
-        if (encoding == android.media.AudioFormat.ENCODING_PCM_FLOAT) {
-            bytesPerSample = 4;
-        } else if (encoding == android.media.AudioFormat.ENCODING_PCM_8BIT) {
-            bytesPerSample = 1;
-        } else {
-            bytesPerSample = 2;
-        }
+        int bytesPerSample = bytesPerSample(encoding);
         channels = Math.max(1, Math.min(channels, 8));
-        sampleRate = Math.max(8000, Math.min(192000, sampleRate));
         int inputFrames = input.length / (bytesPerSample * channels);
         if (inputFrames == 0) {
             return new byte[0];
         }
-        double phase = resamplePhase;
-        double step = sampleRate / (double) PcmRingBuffer.OUTPUT_RATE;
-        int outputFrames = Math.max(1,
-                (int) Math.ceil((inputFrames - phase) / step));
-        byte[] result = new byte[outputFrames * 4];
+        byte[] result = new byte[inputFrames * 4];
         ByteBuffer source = ByteBuffer.wrap(input).order(ByteOrder.LITTLE_ENDIAN);
         ByteBuffer target = ByteBuffer.wrap(result).order(ByteOrder.LITTLE_ENDIAN);
-        for (int frame = 0; frame < outputFrames; frame++) {
-            double position = phase + frame * step;
-            int first = Math.min((int) position, inputFrames - 1);
-            int second = Math.min(first + 1, inputFrames - 1);
-            double fraction = position - first;
-            int left = readSample(source, first, 0, channels, encoding, bytesPerSample);
-            int right = readSample(source, first, channels > 1 ? 1 : 0, channels, encoding, bytesPerSample);
-            int nextLeft = readSample(source, second, 0, channels, encoding, bytesPerSample);
-            int nextRight = readSample(source, second, channels > 1 ? 1 : 0, channels, encoding, bytesPerSample);
-            short outLeft = (short) Math.max(Short.MIN_VALUE,
-                    Math.min(Short.MAX_VALUE, Math.round(left + (nextLeft - left) * fraction)));
-            short outRight = (short) Math.max(Short.MIN_VALUE,
-                    Math.min(Short.MAX_VALUE, Math.round(right + (nextRight - right) * fraction)));
-            target.putShort(outLeft);
-            target.putShort(outRight);
+        for (int frame = 0; frame < inputFrames; frame++) {
+            int left = readSample(source, frame, 0, channels, encoding, bytesPerSample);
+            int right = readSample(source, frame, channels > 1 ? 1 : 0,
+                    channels, encoding, bytesPerSample);
+            target.putShort((short) left);
+            target.putShort((short) right);
         }
-        resamplePhase = phase + outputFrames * step - inputFrames;
         return result;
+    }
+
+    private static int bytesPerSample(int encoding) {
+        if (encoding == android.media.AudioFormat.ENCODING_PCM_FLOAT
+                || encoding == android.media.AudioFormat.ENCODING_PCM_32BIT) {
+            return 4;
+        }
+        if (encoding == android.media.AudioFormat.ENCODING_PCM_24BIT_PACKED) {
+            return 3;
+        }
+        return encoding == android.media.AudioFormat.ENCODING_PCM_8BIT ? 1 : 2;
     }
 
     private static int readSample(ByteBuffer source, int frame, int channel, int channels,
@@ -168,7 +162,16 @@ final class PcmDecoder implements Runnable {
         int offset = (frame * channels + channel) * bytesPerSample;
         if (encoding == android.media.AudioFormat.ENCODING_PCM_FLOAT) {
             float value = source.getFloat(offset);
-            return Math.max(-32768, Math.min(32767, Math.round(value * 32767)));
+            return Math.max(Short.MIN_VALUE, Math.min(Short.MAX_VALUE, Math.round(value * 32767)));
+        }
+        if (encoding == android.media.AudioFormat.ENCODING_PCM_32BIT) {
+            return source.getInt(offset) >> 16;
+        }
+        if (encoding == android.media.AudioFormat.ENCODING_PCM_24BIT_PACKED) {
+            int sample = (source.get(offset) & 0xff)
+                    | ((source.get(offset + 1) & 0xff) << 8)
+                    | (source.get(offset + 2) << 16);
+            return sample >> 8;
         }
         if (encoding == android.media.AudioFormat.ENCODING_PCM_8BIT) {
             return ((source.get(offset) & 0xff) - 128) << 8;
