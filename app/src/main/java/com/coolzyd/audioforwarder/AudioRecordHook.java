@@ -12,6 +12,7 @@ import android.os.IBinder;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.Arrays;
 import java.util.Map;
 import java.util.WeakHashMap;
 
