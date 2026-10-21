@@ -11,6 +11,7 @@ import android.media.AudioAttributes;
 import android.media.MediaPlayer;
 import android.net.Uri;
 import android.os.Build;
+import android.os.IBinder;
 
 public final class ForwardingService extends Service {
     public static final String ACTION_START = "com.coolzyd.audioforwarder.START";
@@ -57,6 +58,11 @@ public final class ForwardingService extends Service {
             return START_NOT_STICKY;
         }
         return START_NOT_STICKY;
+    }
+
+    @Override
+    public IBinder onBind(Intent intent) {
+        return null;
     }
 
     @Override
